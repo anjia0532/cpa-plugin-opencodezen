@@ -1751,29 +1751,35 @@ func requestIdentity(req executorRequest) string {
 // resolveSession returns the canonical ses_ id for this conversation.
 // Priority: existing canonical client value → first present client session
 // header → metadata canonical_session_id → content-derived fallback.
+//
+// The returned id always satisfies the free-tier gate invariant
+// (ses_ + 12 lowercase hex chars whose low 12 bits are 0xFFE). Client values
+// that only look canonical are re-minted instead of being forwarded, and
+// minting is cached per conversation source so multi-turn requests keep the
+// same id (session affinity + upstream prompt cache).
 func resolveSession(req *executorRequest) (string, bool) {
 	if existing, exists := headerValue(req.Headers, targetSessionHeader); exists {
 		if existing == "" {
 			return "", false
 		}
-		if canonicalSessionRe.MatchString(existing) {
+		if isGateSessionID(existing) {
 			return existing, true
 		}
-		return canonicalID("ses", existing), true
+		return sessionIDForSource("client:" + existing), true
 	}
 	for _, src := range sessionSources {
 		if v, exists := headerValue(req.Headers, src); exists {
 			if v == "" {
 				return "", false
 			}
-			return canonicalID("ses", v), true
+			return sessionIDForSource("client:" + v), true
 		}
 	}
 	if src := sessionFallback(req.Metadata); src != "" {
-		return canonicalID("ses", src), true
+		return sessionIDForSource("meta:" + src), true
 	}
 	if src := contentFallback(req); src != "" {
-		return canonicalID("ses", src), true
+		return sessionIDForSource("content:" + src), true
 	}
 	return "", false
 }
@@ -2855,17 +2861,62 @@ func clampMaxOutput(root map[string]any, model string) {
 // Identifier ids.
 const officialIDAlphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
-// newOfficialSessionID mints a session id in the official descending
-// format (ses_ + 12 hex chars of the bitwise-inverted millisecond timestamp
-// + 14 base62 chars), so the id decodes as freshly created. Used when a
-// retry needs a session the upstream has never seen.
+// gateSessionLowHex is the invariant the free-tier endpoint checks on the
+// session id: the 12 hex chars carry 0xFFE in their low 12 bits.
+const gateSessionLowHex = "ffe"
+
+// zenSessionEpochMillis is the constant the official client counts down from:
+// the 12 hex chars are ((zenSessionEpochMillis - unixMilli) << 12) | 0xFFE, so
+// the low 12 bits stay pinned to 0xFFE and the high 36 bits descend as time
+// passes. Once the clock passes the epoch the field wraps, which the client
+// treats as a wrapped 36-bit counter.
+const zenSessionEpochMillis = 27 << 36
+
+// maxCachedSessionIDs bounds the per-source session id cache.
+const maxCachedSessionIDs = 4096
+
+// isGateSessionID reports whether an id satisfies the free-tier gate: the
+// canonical shape plus 0xFFE in the low 12 bits of the hex field.
+func isGateSessionID(id string) bool {
+	if !canonicalSessionRe.MatchString(id) {
+		return false
+	}
+	return id[13:16] == gateSessionLowHex
+}
+
+var (
+	sessionIDCacheMu sync.Mutex
+	sessionIDCache   = map[string]string{}
+)
+
+// sessionIDForSource returns a gate-valid ses_ id for one conversation source,
+// minting it on first use and reusing it afterwards so every turn of a
+// conversation keeps the same session (affinity + upstream prompt cache).
+func sessionIDForSource(source string) string {
+	sessionIDCacheMu.Lock()
+	defer sessionIDCacheMu.Unlock()
+	if id, ok := sessionIDCache[source]; ok {
+		return id
+	}
+	if len(sessionIDCache) >= maxCachedSessionIDs {
+		sessionIDCache = map[string]string{}
+	}
+	id := newOfficialSessionID()
+	sessionIDCache[source] = id
+	return id
+}
+
+// newOfficialSessionID mints a session id in the official descending format
+// (ses_ + 12 hex chars of the descending millisecond timestamp + 14 base62
+// chars) so the id reads as freshly created by the official client, including
+// the 0xFFE low bits the free-tier gate requires. Used when a retry needs a
+// session the upstream has never seen.
 func newOfficialSessionID() string {
-	combined := uint64(time.Now().UnixMilli())<<12 | uint64(time.Now().UnixNano()&0xfff)
-	inverted := ^combined
+	value := uint64((zenSessionEpochMillis-time.Now().UnixMilli())<<12|0xFFE) & 0xFFFFFFFFFFFF
 	const hexDigits = "0123456789abcdef"
 	var hexPart [12]byte
 	for i := 0; i < 6; i++ {
-		b := byte((inverted >> (40 - 8*i)) & 0xff)
+		b := byte(value >> (40 - 8*i))
 		hexPart[i*2] = hexDigits[b>>4]
 		hexPart[i*2+1] = hexDigits[b&0xf]
 	}
@@ -2942,7 +2993,10 @@ func firstUserTextFromItems(items []any) string {
 // ---------------------------------------------------------------------------
 
 // canonicalID deterministically maps an arbitrary source string onto zen's
-// canonical id shapes (ses_/msg_ + 12 hex + 14 alphanumerics, 30 chars).
+// canonical id shapes (msg_/chatcmpl_/call_ + 12 hex + 14 alphanumerics,
+// 30 chars). Session ids must not be minted here: the free-tier gate reads
+// the low 12 bits of the hex field, which a hash does not satisfy. Use
+// sessionIDForSource for ses_ ids.
 func canonicalID(prefix, source string) string {
 	sum := sha256.Sum256([]byte(source))
 	hexPart := hex.EncodeToString(sum[:6])

@@ -471,13 +471,11 @@ func TestRouteForModelUnknownInference(t *testing.T) {
 // gate: canonical IDs
 // =========================================================================
 
-func TestCanonicalIDSesShape(t *testing.T) {
-	id := canonicalID("ses", "test-source")
-	if !canonicalShapeRe.MatchString(id) {
-		t.Fatalf("id = %q, want ses_<12hex><14alnum>", id)
-	}
-	if len(id) != 30 {
-		t.Fatalf("id length = %d, want 30", len(id))
+func TestCanonicalIDChatcmplShape(t *testing.T) {
+	id := canonicalID("chatcmpl", "test-source")
+	shape := regexp.MustCompile(`^chatcmpl_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
+	if !shape.MatchString(id) {
+		t.Fatalf("id = %q, want chatcmpl_<12hex><14alnum>", id)
 	}
 }
 
@@ -492,18 +490,27 @@ func TestCanonicalIDMsgShape(t *testing.T) {
 }
 
 func TestCanonicalIDDeterministic(t *testing.T) {
-	a := canonicalID("ses", "source")
-	b := canonicalID("ses", "source")
+	a := canonicalID("msg", "source")
+	b := canonicalID("msg", "source")
 	if a != b {
 		t.Fatal("canonicalID is not deterministic")
 	}
 }
 
 func TestCanonicalIDDistinctSources(t *testing.T) {
-	a := canonicalID("ses", "source-a")
-	b := canonicalID("ses", "source-b")
+	a := canonicalID("msg", "source-a")
+	b := canonicalID("msg", "source-b")
 	if a == b {
 		t.Fatal("distinct sources must produce distinct ids")
+	}
+}
+
+// TestCanonicalIDSessionPrefixIsNotGateValid documents why sessions must not
+// be minted by canonicalID: the hash-derived hex field does not carry the
+// 0xFFE low bits the free-tier gate reads.
+func TestCanonicalIDSessionPrefixIsNotGateValid(t *testing.T) {
+	if isGateSessionID(canonicalID("ses", "real-client")) {
+		t.Fatal("hash-derived session id unexpectedly passed the gate check")
 	}
 }
 
@@ -520,9 +527,9 @@ func TestResolveSessionFromClientHeader(t *testing.T) {
 	}
 }
 
-func TestResolveSessionFromExistingCanonical(t *testing.T) {
+func TestResolveSessionPassesGateValidClientValue(t *testing.T) {
 	resetConfig(t, testConfig())
-	existing := canonicalID("ses", "real-client")
+	existing := newOfficialSessionID()
 	req := &executorRequest{
 		Model:   "mimo-v2.6-flash-free",
 		Payload: chatPayload("mimo-v2.6-flash-free", "hello"),
@@ -531,6 +538,68 @@ func TestResolveSessionFromExistingCanonical(t *testing.T) {
 	session, ok := resolveSession(req)
 	if !ok || session != existing {
 		t.Fatalf("session = %q, want %q", session, existing)
+	}
+}
+
+// TestResolveSessionRemintsUngatedClientValue covers the regression that made
+// every free-tier request fail with "403 FreeTierError": a client value that
+// only looks canonical (hash-derived hex field) must be replaced by a gate
+// valid id, and the replacement must stay stable for that conversation.
+func TestResolveSessionRemintsUngatedClientValue(t *testing.T) {
+	resetConfig(t, testConfig())
+	existing := canonicalID("ses", "real-client")
+	if isGateSessionID(existing) {
+		t.Fatalf("fixture %q unexpectedly passes the gate check", existing)
+	}
+	req := &executorRequest{
+		Model:   "mimo-v2.6-flash-free",
+		Payload: chatPayload("mimo-v2.6-flash-free", "hello"),
+		Headers: map[string][]string{targetSessionHeader: {existing}},
+	}
+	session, ok := resolveSession(req)
+	if !ok || session == existing {
+		t.Fatalf("session = %q, want a re-minted id", session)
+	}
+	if !isGateSessionID(session) {
+		t.Fatalf("re-minted session %q is not gate valid", session)
+	}
+	again, _ := resolveSession(req)
+	if again != session {
+		t.Fatalf("re-minted session id is not stable: %q then %q", session, again)
+	}
+}
+
+// TestResolveSessionAlwaysGateValid walks every resolution path: the returned
+// id must satisfy the gate invariant the upstream enforces.
+func TestResolveSessionAlwaysGateValid(t *testing.T) {
+	resetConfig(t, testConfig())
+	requests := []*executorRequest{
+		{
+			Model:   "mimo-v2.6-flash-free",
+			Payload: chatPayload("mimo-v2.6-flash-free", "hello"),
+			Headers: map[string][]string{"Session-Id": {"codex-session-1"}},
+		},
+		{
+			Model:    "mimo-v2.6-flash-free",
+			Payload:  chatPayload("mimo-v2.6-flash-free", "hello"),
+			Headers:  map[string][]string{},
+			Metadata: map[string]any{"canonical_session_id": "claude:probe-1"},
+		},
+		{
+			Model:    "mimo-v2.6-flash-free",
+			Payload:  chatPayload("mimo-v2.6-flash-free", "unique-opening"),
+			Headers:  map[string][]string{},
+			Metadata: map[string]any{},
+		},
+	}
+	for i, req := range requests {
+		session, ok := resolveSession(req)
+		if !ok {
+			t.Fatalf("request %d did not resolve a session", i)
+		}
+		if !isGateSessionID(session) {
+			t.Fatalf("request %d resolved gate-invalid session %q", i, session)
+		}
 	}
 }
 

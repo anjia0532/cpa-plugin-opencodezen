@@ -68,6 +68,7 @@ import (
 	"sync"
 	"time"
 	"unicode"
+	"unicode/utf8"
 	"unsafe"
 
 	"gopkg.in/yaml.v3"
@@ -91,7 +92,7 @@ const (
 	defaultUserAgent = "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
 )
 
-var pluginVersion = "0.7.3"
+var pluginVersion = "0.8.0"
 
 var (
 	canonicalSessionRe = regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
@@ -146,15 +147,20 @@ type pluginConfig struct {
 	Client        string
 	Project       string
 	Models        []modelRoute
+
+	// StreamRetries bounds the automatic reconnects of a broken upstream
+	// stream (silent truncation, transport EOF, 5xx). yaml: stream-retries.
+	StreamRetries int
 }
 
 func defaultPluginConfig() pluginConfig {
 	return pluginConfig{
-		Enabled:  true,
-		Provider: pluginProvider,
-		BaseURL:  zenBaseURL,
-		Client:   "cli",
-		Project:  "global",
+		Enabled:       true,
+		Provider:      pluginProvider,
+		BaseURL:       zenBaseURL,
+		Client:        "cli",
+		Project:       "global",
+		StreamRetries: 3,
 	}
 }
 
@@ -205,6 +211,12 @@ func configure(raw []byte) error {
 	}
 	if cfg.Project = strings.TrimSpace(cfg.Project); cfg.Project == "" {
 		cfg.Project = "global"
+	}
+	if cfg.StreamRetries < 0 {
+		cfg.StreamRetries = 0
+	}
+	if cfg.StreamRetries > 10 {
+		cfg.StreamRetries = 10
 	}
 	cfg.APIKeys = trimNonEmpty(cfg.APIKeys)
 	cfg.ExcludeModels = trimNonEmpty(cfg.ExcludeModels)
@@ -278,6 +290,9 @@ func applyConfigNode(cfg *pluginConfig, node map[string]any) {
 	}
 	if v, ok := node["client"].(string); ok {
 		cfg.Client = v
+	}
+	if _, ok := node["stream-retries"]; ok {
+		cfg.StreamRetries = int(intValue(node["stream-retries"], node["stream_retries"]))
 	}
 	if v, ok := node["project"].(string); ok {
 		cfg.Project = v
@@ -1358,7 +1373,12 @@ func executeNonStream(req executorRequest, cfg pluginConfig, route modelRoute, b
 	endpoints := candidateEndpoints(cfg, route)
 	var lastErr error
 	authRetry := false
+	// transportFailed marks errors a fresh connection may fix (host HTTP
+	// failures such as connection resets / unexpected EOF); status errors
+	// and payload-shape errors never are.
+	transportFailed := false
 	run := func(key string, hdrs map[string][]string) ([]byte, error) {
+		transportFailed = false
 		for _, ep := range endpoints {
 			r := route
 			r.Endpoint = ep
@@ -1370,6 +1390,7 @@ func executeNonStream(req executorRequest, cfg pluginConfig, route modelRoute, b
 			}
 			body, respHeaders, status, err := doUpstream(req.HostCallbackID, http.MethodPost, baseURL+r.EndpointPath(), hdrs, key, upstreamBody)
 			if err != nil {
+				transportFailed = true
 				return nil, err
 			}
 			if status < 200 || status >= 300 {
@@ -1407,6 +1428,13 @@ func executeNonStream(req executorRequest, cfg pluginConfig, route modelRoute, b
 	if err != nil && authRetry {
 		apiKey = nextAPIKey(cfg)
 		refreshGateSession(headers)
+		out, err = run(apiKey, headers)
+	}
+	// Transport-level failures (connection reset, unexpected EOF) are
+	// transient: retry the whole fold with backoff so a broken connection
+	// never surfaces as a failed turn.
+	for i := 0; err != nil && transportFailed && i < cfg.StreamRetries; i++ {
+		time.Sleep(streamRetryDelay(i + 1))
 		out, err = run(apiKey, headers)
 	}
 	return out, err
@@ -1458,6 +1486,176 @@ func apiKeyForRequest(req executorRequest, cfg pluginConfig) string {
 	return nextAPIKey(cfg)
 }
 
+// ---------------------------------------------------------------------------
+// stream resume (automatic reconnect of a broken upstream stream)
+// ---------------------------------------------------------------------------
+
+// streamResumeMaxPartialBytes caps the partial assistant text replayed into
+// a continuation prompt; the tail is what matters for resuming mid-answer.
+const streamResumeMaxPartialBytes = 8000
+
+// streamResumeInstruction is the user turn appended after the partial
+// assistant answer when resuming a stream that broke mid-answer.
+const streamResumeInstruction = "Your previous response was interrupted mid-stream by a network error. " +
+	"Continue the unfinished task exactly from where you stopped, resuming mid-sentence if needed. " +
+	"Do not repeat, rephrase, or summarize anything you already output, and do not add any preamble, " +
+	"apology, or meta-commentary about the interruption."
+
+// upstreamIdleTimeout gives an upstream that connects but then sends nothing
+// (or stalls mid-generation far longer than any muse pause) before the
+// plugin abandons the stream and reconnects.
+const upstreamIdleTimeout = 60 * time.Second
+
+// streamRetryDelay is the backoff before reconnect attempt n (1-based).
+func streamRetryDelay(n int) time.Duration {
+	d := time.Second << (n - 1)
+	if d > 8*time.Second {
+		d = 8 * time.Second
+	}
+	return d
+}
+
+// streamRetryableStatus reports whether an upstream HTTP status may succeed
+// on a fresh connection (server-side or transient gateway trouble). Auth,
+// quota, and request-shape errors never are.
+func streamRetryableStatus(status int) bool {
+	return status >= 500 || status == 408
+}
+
+// streamResumeMonitor records what the downstream client has already seen of
+// the in-flight answer so a broken upstream stream can be resumed instead of
+// silently truncated: whether the terminal event was forwarded, whether any
+// tool-call frame was forwarded (a half-sent tool call cannot be resumed),
+// and the assistant text emitted so far.
+type streamResumeMonitor struct {
+	sawFinish   bool
+	sawToolCall bool
+	partial     strings.Builder
+}
+
+// observeChatFrame inspects one outbound chat-completions chunk frame (both
+// the chat passthrough and the responses->chat converter emit this shape).
+func (m *streamResumeMonitor) observeChatFrame(frame []byte) {
+	payload := strings.TrimSpace(stripSSEDataFraming(frame))
+	if payload == "" || isDoneTerminator(payload) {
+		return
+	}
+	var chunk struct {
+		Choices []struct {
+			Delta struct {
+				Content   string            `json:"content"`
+				ToolCalls []json.RawMessage `json:"tool_calls"`
+			} `json:"delta"`
+			FinishReason *string `json:"finish_reason"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+		return
+	}
+	for _, choice := range chunk.Choices {
+		if choice.FinishReason != nil && *choice.FinishReason != "" {
+			m.sawFinish = true
+		}
+		if len(choice.Delta.ToolCalls) > 0 {
+			m.sawToolCall = true
+		}
+		if choice.Delta.Content != "" {
+			m.partial.WriteString(choice.Delta.Content)
+			// Keep only the tail once the answer outgrows the cap so a
+			// very long stream cannot grow the resume prompt unbounded.
+			if m.partial.Len() > 2*streamResumeMaxPartialBytes {
+				kept := m.partial.String()
+				m.partial.Reset()
+				m.partial.WriteString(streamResumeElidedMarker + resumeTailString(kept, streamResumeMaxPartialBytes))
+			}
+		}
+	}
+}
+
+// streamResumeElidedMarker prefixes a tail-only partial answer.
+const streamResumeElidedMarker = "[... earlier output omitted; continue from the text below ...]\n"
+
+// resumeTailString keeps the last n bytes of s on a UTF-8 rune boundary.
+func resumeTailString(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	tail := s[len(s)-n:]
+	for len(tail) > 0 && !utf8.RuneStart(tail[0]) {
+		tail = tail[1:]
+	}
+	return tail
+}
+
+// partialText returns the assistant text emitted downstream so far.
+func (m *streamResumeMonitor) partialText() string {
+	return strings.TrimSpace(m.partial.String())
+}
+
+// appendContinuationPayload returns the request payload extended with the
+// partial answer (as an assistant turn) and the resume instruction (as a
+// user turn), so the reconnected upstream continues the broken stream
+// instead of restarting the answer. The payload's own dialect is preserved;
+// prepareUpstreamBody converts it to the route endpoint as usual. An empty
+// partial yields the payload unchanged (transparent replay).
+func appendContinuationPayload(payload []byte, partial string) ([]byte, error) {
+	trimmed := strings.TrimSpace(string(payload))
+	if trimmed == "" || trimmed[0] != '{' {
+		return nil, fmt.Errorf("zen stream resume: unsupported payload shape")
+	}
+	var root map[string]any
+	if err := json.Unmarshal(payload, &root); err != nil {
+		return nil, fmt.Errorf("zen stream resume: payload is not valid JSON: %w", err)
+	}
+	partial = strings.TrimSpace(partial)
+	if partial == "" {
+		// Nothing was forwarded downstream yet: replay the request as-is.
+		return payload, nil
+	}
+	if len(partial) > streamResumeMaxPartialBytes {
+		partial = streamResumeElidedMarker + resumeTailString(partial, streamResumeMaxPartialBytes)
+	}
+	switch items := root["messages"].(type) {
+	case []any:
+		if partial != "" {
+			items = append(items, map[string]any{"role": "assistant", "content": partial})
+		}
+		items = append(items, map[string]any{"role": "user", "content": streamResumeInstruction})
+		root["messages"] = items
+	default:
+		switch input := root["input"].(type) {
+		case []any:
+			if partial != "" {
+				input = append(input, map[string]any{
+					"type":    "message",
+					"role":    "assistant",
+					"content": []any{map[string]any{"type": "output_text", "text": partial}},
+				})
+			}
+			input = append(input, map[string]any{
+				"type":    "message",
+				"role":    "user",
+				"content": []any{map[string]any{"type": "input_text", "text": streamResumeInstruction}},
+			})
+			root["input"] = input
+		case string:
+			joined := input
+			if partial != "" {
+				joined += "\n\n[assistant, interrupted]\n" + partial
+			}
+			joined += "\n\n[user]\n" + streamResumeInstruction
+			root["input"] = joined
+		default:
+			return nil, fmt.Errorf("zen stream resume: payload has no messages/input to extend")
+		}
+	}
+	out, err := json.Marshal(root)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // runStream performs the upstream call and forwards SSE frames through the
 // host stream bridge until done, then closes the plugin stream.
 func runStream(req executorRequest, cfg pluginConfig, route modelRoute, baseURL string, headers map[string][]string, apiKey string, streamID string) {
@@ -1470,85 +1668,87 @@ func runStream(req executorRequest, cfg pluginConfig, route modelRoute, baseURL 
 		}
 	}()
 
+	endpoints := candidateEndpoints(cfg, route)
+	maxRetries := cfg.StreamRetries
+
+	drainHostStream := func(id string) {
+		for i := 0; i < 8; i++ {
+			chunk, errRead := readHostStream(id)
+			if errRead != nil || chunk.Done || chunk.Error != "" {
+				break
+			}
+		}
+	}
+
+	// The upstream payload is rebuilt on every attempt: a resumed stream
+	// carries the partial answer plus a continuation instruction.
+	payload := append([]byte(nil), req.Payload...)
+	if len(payload) == 0 {
+		payload = append([]byte(nil), req.OriginalRequest...)
+	}
+
 	// Endpoint auto-detection: without an explicitly configured endpoint, a
 	// path-level failure (400/404/405) from the first candidate is retried
-	// once against the opposite dialect and the winner is remembered.
-	endpoints := candidateEndpoints(cfg, route)
-	selectUpstream := func(key string, hdrs map[string][]string) (*hostStreamHandle, string, string) {
+	// once against the opposite dialect and the winner is remembered. The
+	// bool result separates retryable transport errors (fresh connection may
+	// succeed) from payload-shape errors (never succeed).
+	selectUpstream := func(key string, hdrs map[string][]string) (*hostStreamHandle, string, string, bool) {
+		rreq := req
+		rreq.Payload = payload
 		var handle *hostStreamHandle
 		used := ""
 		for _, ep := range endpoints {
 			r := route
 			r.Endpoint = ep
 			// Gate rule 4: zen only answers streaming requests.
-			body, err := prepareUpstreamBody(req, r)
+			body, err := prepareUpstreamBody(rreq, r)
 			if err != nil {
-				return nil, "", err.Error()
+				return nil, "", err.Error(), false
 			}
-			h, err := doUpstreamStream(req.HostCallbackID, http.MethodPost, baseURL+r.EndpointPath(), hdrs, key, body)
+			h, err := doUpstreamStream(rreq.HostCallbackID, http.MethodPost, baseURL+r.EndpointPath(), hdrs, key, body)
 			if err != nil {
-				return nil, "", err.Error()
+				return nil, "", err.Error(), true
 			}
 			handle = h
 			used = ep
 			if isEndpointMismatch(h.StatusCode) && ep == endpoints[0] && len(endpoints) > 1 {
 				// Drain the error body so the abandoned host stream is reaped.
-				for i := 0; i < 8; i++ {
-					chunk, errRead := readHostStream(h.StreamID)
-					if errRead != nil || chunk.Done || chunk.Error != "" {
-						break
-					}
-				}
+				drainHostStream(h.StreamID)
 				continue
 			}
 			break
 		}
-		return handle, used, ""
+		return handle, used, "", true
 	}
-	resp, usedEndpoint, errMsg := selectUpstream(apiKey, headers)
-	if errMsg != "" {
-		closeStream(errMsg)
-		return
-	}
-	if resp == nil {
-		closeStream("zen upstream: no endpoint attempted")
-		return
-	}
-	if usedEndpoint != endpoints[0] {
-		rememberEndpoint(route.Model, usedEndpoint)
-	}
-	if resp.StatusCode == 401 || resp.StatusCode == 403 {
-		// Auth-level failure (401 credits/auth, 403 region/policy): rotate
-		// the key and mint a fresh session, then retry once.
-		for i := 0; i < 8; i++ {
-			chunk, errRead := readHostStream(resp.StreamID)
-			if errRead != nil || chunk.Done || chunk.Error != "" {
-				break
+
+	key := apiKey
+	// connectOne opens an upstream stream, rotating the key and minting a
+	// fresh session once on auth-level failure (401 credits/auth, 403
+	// region/policy). It returns the final handle or a classified error.
+	connectOne := func() (*hostStreamHandle, string, string, bool) {
+		h, used, errMsg, retryable := selectUpstream(key, headers)
+		if errMsg != "" {
+			return nil, "", errMsg, retryable
+		}
+		if h == nil {
+			return nil, "", "zen upstream: no endpoint attempted", false
+		}
+		if h.StatusCode == 401 || h.StatusCode == 403 {
+			drainHostStream(h.StreamID)
+			key = nextAPIKey(cfg)
+			refreshGateSession(headers)
+			h, used, errMsg, retryable = selectUpstream(key, headers)
+			if errMsg != "" {
+				return nil, "", errMsg, retryable
+			}
+			if h == nil {
+				return nil, "", "zen upstream: no endpoint attempted", false
 			}
 		}
-		apiKey = nextAPIKey(cfg)
-		refreshGateSession(headers)
-		resp, usedEndpoint, errMsg = selectUpstream(apiKey, headers)
-		if errMsg != "" {
-			closeStream(errMsg)
-			return
+		if used != "" && used != endpoints[0] {
+			rememberEndpoint(route.Model, used)
 		}
-		if resp == nil {
-			closeStream("zen upstream: no endpoint attempted")
-			return
-		}
-		if usedEndpoint != endpoints[0] {
-			rememberEndpoint(route.Model, usedEndpoint)
-		}
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		// Drain a bit of the error body for the message, then close.
-		errBody := ""
-		if chunk, errRead := readHostStream(resp.StreamID); errRead == nil && len(chunk.Payload) > 0 {
-			errBody = truncate(chunk.Payload, 512)
-		}
-		closeStream(fmt.Sprintf("zen upstream status %d: %s", resp.StatusCode, errBody))
-		return
+		return h, used, "", true
 	}
 
 	// Chat-completions clients (SourceFormat "openai" / "chat-completions") get
@@ -1560,14 +1760,27 @@ func runStream(req executorRequest, cfg pluginConfig, route modelRoute, baseURL 
 	src := strings.ToLower(strings.TrimSpace(req.SourceFormat))
 	rawData := src == "openai" || strings.Contains(src, "chat")
 
-	emit := func(frame []byte) error { return emitStreamFrame(streamID, frame) }
+	// The monitor watches every outbound chat frame: both the chat
+	// passthrough and the responses->chat converter emit chat chunks, so
+	// terminal detection (finish_reason) and partial-text capture are
+	// dialect-uniform. Heartbeats bypass the monitor on purpose.
+	monitor := &streamResumeMonitor{}
+	const heartbeatInterval = 10 * time.Second
+	lastEmit := time.Now()
+
+	emitChat := func(frame []byte) error {
+		monitor.observeChatFrame(frame)
+		lastEmit = time.Now()
+		return emitStreamFrame(streamID, frame)
+	}
+	emit := emitChat
 	if route.Endpoint == "responses" {
 		// The plugin declares chat-completions output, so the host expects chat
 		// chunks; upstream /responses events must be converted first.
 		conv := newResponsesChatStreamConverter(req.Model)
 		emit = func(frame []byte) error {
-			payload := stripSSEDataFraming(frame)
-			outs, err := conv.convert([]byte(payload))
+			upstream := stripSSEDataFraming(frame)
+			outs, err := conv.convert([]byte(upstream))
 			if err != nil {
 				return err
 			}
@@ -1576,7 +1789,7 @@ func runStream(req executorRequest, cfg pluginConfig, route modelRoute, baseURL 
 				if !rawData {
 					framed = []byte("data: " + string(out) + "\n\n")
 				}
-				if err := emitStreamFrame(streamID, framed); err != nil {
+				if err := emitChat(framed); err != nil {
 					return err
 				}
 			}
@@ -1584,107 +1797,183 @@ func runStream(req executorRequest, cfg pluginConfig, route modelRoute, baseURL 
 		}
 	}
 
-	// Track downstream activity so the heartbeat below only fires while
-	// the upstream is genuinely quiet.
-	lastEmit := time.Now()
-	baseEmit := emit
-	emit = func(frame []byte) error {
-		lastEmit = time.Now()
-		return baseEmit(frame)
+	type pumpOutcome struct {
+		terminal  bool
+		retryable bool
+		errMsg    string
 	}
 
-	reassembler := &sseReassembler{
-		rawData: rawData,
-		emit:    emit,
-	}
-
-	// Read the upstream in a goroutine so the forwarding loop can also watch
-	// a heartbeat clock: muse-class models can pause 15s+ mid-generation, and
-	// an entirely silent downstream connection gets dropped by idle-sensitive
-	// hops (NAT, proxies, client transports without pings). A no-op chat
-	// chunk (empty delta) is the standard keep-alive shape and keeps bytes on
-	// the wire without disturbing the translated stream.
-	type upstreamChunk struct {
-		chunk httpStreamChunk
-		err   error
-	}
-	chunks := make(chan upstreamChunk, 8)
-	readerDone := make(chan struct{})
-	defer close(readerDone)
-	go func() {
-		defer close(chunks)
-		for {
-			chunk, err := readHostStream(resp.StreamID)
-			if err != nil {
-				select {
-				case chunks <- upstreamChunk{err: err}:
-				case <-readerDone:
-				}
-				return
+	// pump forwards one upstream stream until it ends. A stream that stops
+	// without the terminal event (finish_reason forwarded or [DONE] seen) is
+	// a truncation, not a completion: it is reported as retryable so the
+	// caller can reconnect and resume mid-answer.
+	pump := func(h *hostStreamHandle) pumpOutcome {
+		reassembler := &sseReassembler{
+			rawData: rawData,
+			emit:    emit,
+		}
+		terminal := func() bool { return monitor.sawFinish || reassembler.sawDone }
+		truncated := func() pumpOutcome {
+			// Emit the tail event when its data lines were complete; a
+			// fragment cut mid-line would corrupt the downstream stream.
+			if reassembler.lineBuf.Len() == 0 {
+				_ = reassembler.flushPending()
 			}
-			select {
-			case chunks <- upstreamChunk{chunk: chunk}:
-			case <-readerDone:
-				return
+			if terminal() {
+				return pumpOutcome{terminal: true}
 			}
-			if chunk.Done || chunk.Error != "" {
-				return
+			return pumpOutcome{
+				retryable: true,
+				errMsg:    "zen upstream stream ended before the finish marker",
 			}
 		}
-	}()
+		type upstreamChunk struct {
+			chunk httpStreamChunk
+			err   error
+		}
+		chunks := make(chan upstreamChunk, 8)
+		readerDone := make(chan struct{})
+		defer close(readerDone)
+		go func() {
+			defer close(chunks)
+			for {
+				chunk, err := readHostStream(h.StreamID)
+				if err != nil {
+					select {
+					case chunks <- upstreamChunk{err: err}:
+					case <-readerDone:
+					}
+					return
+				}
+				select {
+				case chunks <- upstreamChunk{chunk: chunk}:
+				case <-readerDone:
+					return
+				}
+				if chunk.Done || chunk.Error != "" {
+					return
+				}
+			}
+		}()
+		ticker := time.NewTicker(heartbeatInterval)
+		defer ticker.Stop()
+		lastRead := time.Now()
+		for {
+			select {
+			case sc, ok := <-chunks:
+				if !ok {
+					return truncated()
+				}
+				lastRead = time.Now()
+				if sc.err != nil {
+					if terminal() {
+						// The answer was complete; the trailing read error
+						// only means the body closed uncleanly.
+						return pumpOutcome{terminal: true}
+					}
+					return pumpOutcome{retryable: true, errMsg: sc.err.Error()}
+				}
+				if sc.chunk.Error != "" {
+					if terminal() {
+						return pumpOutcome{terminal: true}
+					}
+					return pumpOutcome{retryable: true, errMsg: sc.chunk.Error}
+				}
+				// Process the payload before honoring Done: the host bridge may
+				// deliver the final body bytes together with the done marker in one
+				// chunk, and dropping them would truncate the tail of the answer.
+				if len(sc.chunk.Payload) > 0 {
+					if err := reassembler.write(sc.chunk.Payload); err != nil {
+						// Downstream emit failure or an upstream-declared
+						// response failure: reconnecting cannot help.
+						return pumpOutcome{errMsg: err.Error()}
+					}
+				}
+				if sc.chunk.Done {
+					return truncated()
+				}
+			case <-ticker.C:
+				if time.Since(lastRead) > upstreamIdleTimeout {
+					return pumpOutcome{
+						retryable: true,
+						errMsg:    "zen upstream stalled: no bytes for " + upstreamIdleTimeout.String(),
+					}
+				}
+				if time.Since(lastEmit) < heartbeatInterval {
+					continue
+				}
+				if err := emitHeartbeat(streamID, rawData, req.Model); err != nil {
+					return pumpOutcome{errMsg: err.Error()}
+				}
+				lastEmit = time.Now()
+			}
+		}
+	}
 
-	const heartbeatInterval = 10 * time.Second
-	ticker := time.NewTicker(heartbeatInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case sc, ok := <-chunks:
-			if !ok {
-				// The reader ended without delivering a terminal chunk; treat
-				// whatever was buffered as the whole answer.
-				if err := reassembler.flush(); err != nil {
-					closeStream(err.Error())
-					return
-				}
-				closeStream("")
-				return
+	// attempt loop: each iteration opens a fresh upstream stream. A broken
+	// one is retried with backoff while the downstream bridge stays open;
+	// heartbeats keep it warm during the waits.
+	for attempt := 0; ; attempt++ {
+		giveUp := func(reason string) {
+			if monitor.partialText() != "" && attempt > 0 {
+				reason += fmt.Sprintf(" (zen auto-reconnect gave up after %d attempt(s); the answer above may be incomplete)", attempt)
 			}
-			if sc.err != nil {
-				closeStream(sc.err.Error())
-				return
-			}
-			if sc.chunk.Error != "" {
-				closeStream(sc.chunk.Error)
-				return
-			}
-			// Process the payload before honoring Done: the host bridge may
-			// deliver the final body bytes together with the done marker in one
-			// chunk, and dropping them would truncate the tail of the answer.
-			if len(sc.chunk.Payload) > 0 {
-				if err := reassembler.write(sc.chunk.Payload); err != nil {
-					closeStream(err.Error())
-					return
-				}
-			}
-			if sc.chunk.Done {
-				// Flush any partial line and pending event before closing.
-				if err := reassembler.flush(); err != nil {
-					closeStream(err.Error())
-					return
-				}
-				closeStream("")
-				return
-			}
-		case <-ticker.C:
-			if time.Since(lastEmit) < heartbeatInterval {
+			closeStream(reason)
+		}
+
+		h, _, errMsg, retryable := connectOne()
+		if errMsg != "" {
+			if retryable && attempt < maxRetries {
+				time.Sleep(streamRetryDelay(attempt + 1))
 				continue
 			}
-			if err := emitHeartbeat(streamID, rawData, req.Model); err != nil {
-				closeStream(err.Error())
+			giveUp(errMsg)
+			return
+		}
+		if h.StatusCode < 200 || h.StatusCode >= 300 {
+			// Drain a bit of the error body for the message, then decide.
+			errBody := ""
+			if chunk, errRead := readHostStream(h.StreamID); errRead == nil && len(chunk.Payload) > 0 {
+				errBody = truncate(chunk.Payload, 512)
+			} else {
+				drainHostStream(h.StreamID)
+			}
+			msg := fmt.Sprintf("zen upstream status %d: %s", h.StatusCode, errBody)
+			if streamRetryableStatus(h.StatusCode) && attempt < maxRetries {
+				time.Sleep(streamRetryDelay(attempt + 1))
+				continue
+			}
+			giveUp(msg)
+			return
+		}
+
+		outcome := pump(h)
+		if outcome.terminal {
+			closeStream("")
+			return
+		}
+		drainHostStream(h.StreamID)
+		if !outcome.retryable || monitor.sawToolCall || attempt >= maxRetries {
+			giveUp(outcome.errMsg)
+			return
+		}
+
+		// Resume: replay transparently when nothing was forwarded yet, else
+		// continue the unfinished answer with a fresh upstream request.
+		if partial := monitor.partialText(); partial != "" {
+			next, err := appendContinuationPayload(payload, partial)
+			if err != nil {
+				giveUp(fmt.Sprintf("%s (zen resume impossible: %s)", outcome.errMsg, err.Error()))
 				return
 			}
-			lastEmit = time.Now()
+			payload = next
 		}
+		// A continuation is a new upstream request: mint a fresh canonical
+		// msg_ id so the gate never sees a duplicate request identity.
+		headers[targetRequestHeader] = []string{
+			canonicalID("msg", fmt.Sprintf("%s\x00resume-%d", requestIdentity(req), attempt+1)),
+		}
+		time.Sleep(streamRetryDelay(attempt + 1))
 	}
 }
 
@@ -3241,6 +3530,12 @@ type sseReassembler struct {
 	lineBuf bytes.Buffer
 	pending []string // data payloads of the event currently being assembled
 	emit    func(frame []byte) error
+
+	// sawDone records that an upstream [DONE] terminator was observed and
+	// dropped (the host appends its own done tail). runStream treats it as
+	// proof the stream ended cleanly even when a finish_reason chunk was
+	// never forwarded.
+	sawDone bool
 }
 
 // write feeds one upstream chunk into the reassembler.
@@ -3299,6 +3594,9 @@ func (r *sseReassembler) handleLine(line []byte) error {
 	}
 	frame := normalizeSSEFrame(r.rawData, []byte(s))
 	if len(frame) == 0 || isDoneTerminator(string(frame)) {
+		if isDoneTerminator(string(frame)) {
+			r.sawDone = true
+		}
 		return nil
 	}
 	return r.emit(frame)
@@ -3315,6 +3613,7 @@ func (r *sseReassembler) flushPending() error {
 	joined := strings.Join(r.pending, "\n")
 	r.pending = nil
 	if isDoneTerminator(joined) {
+		r.sawDone = true
 		return nil
 	}
 	if r.rawData {

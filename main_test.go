@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 var canonicalShapeRe = regexp.MustCompile(`^(ses|msg)_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
@@ -1749,5 +1750,238 @@ func TestConfigureParsesSemicolonSeparatedKeys(t *testing.T) {
 		if cfg.APIKeys[i] != k {
 			t.Fatalf("APIKeys = %v, want %v", cfg.APIKeys, want)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// stream resume (automatic reconnect of a broken upstream stream)
+// ---------------------------------------------------------------------------
+
+func TestStreamResumeMonitorChatFrames(t *testing.T) {
+	m := &streamResumeMonitor{}
+	m.observeChatFrame([]byte(`data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}` + "\n\n"))
+	if m.sawFinish {
+		t.Fatal("role chunk must not mark the stream terminal")
+	}
+	m.observeChatFrame([]byte(`data: {"choices":[{"delta":{"content":"你"}}]}` + "\n\n"))
+	m.observeChatFrame([]byte(`data: {"choices":[{"delta":{"content":"好"}}]}` + "\n\n"))
+	m.observeChatFrame([]byte(`data: {"choices":[{"delta":{},"finish_reason":"stop"}]}` + "\n\n"))
+	if !m.sawFinish {
+		t.Fatal("finish_reason chunk must mark the stream terminal")
+	}
+	if got := m.partialText(); got != "你好" {
+		t.Fatalf("partialText = %q, want %q", got, "你好")
+	}
+	if m.sawToolCall {
+		t.Fatal("no tool calls were observed")
+	}
+}
+
+func TestStreamResumeMonitorIgnoresHeartbeatShape(t *testing.T) {
+	m := &streamResumeMonitor{}
+	m.observeChatFrame([]byte(`{"id":"chatcmpl_x","choices":[{"index":0,"delta":{},"finish_reason":null}]}`))
+	if m.sawFinish || m.partialText() != "" || m.sawToolCall {
+		t.Fatal("heartbeat-shaped chunk must not affect the monitor")
+	}
+}
+
+func TestStreamResumeMonitorToolCall(t *testing.T) {
+	m := &streamResumeMonitor{}
+	m.observeChatFrame([]byte(`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"bash","arguments":""}}]}}]}` + "\n\n"))
+	if !m.sawToolCall {
+		t.Fatal("tool_calls delta must flag the monitor")
+	}
+}
+
+func TestStreamResumeMonitorBoundedTail(t *testing.T) {
+	m := &streamResumeMonitor{}
+	big := strings.Repeat("a", 3*streamResumeMaxPartialBytes)
+	m.observeChatFrame([]byte(`data: {"choices":[{"delta":{"content":"` + big + `"}}]}` + "\n\n"))
+	if got := m.partialText(); !strings.HasPrefix(got, streamResumeElidedMarker) {
+		t.Fatalf("oversized partial must be tail-capped, len=%d", len(got))
+	}
+}
+
+func TestAppendContinuationPayloadChat(t *testing.T) {
+	base := chatPayload("deepseek-v4.1-flash-free", "写个东西")
+	next, err := appendContinuationPayload(base, "已经写到一半")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(next, &root); err != nil {
+		t.Fatal(err)
+	}
+	if len(root.Messages) != 3 {
+		t.Fatalf("messages = %d, want 3", len(root.Messages))
+	}
+	if root.Messages[1].Role != "assistant" || root.Messages[1].Content != "已经写到一半" {
+		t.Fatalf("assistant partial = %+v", root.Messages[1])
+	}
+	if root.Messages[2].Role != "user" || !strings.Contains(root.Messages[2].Content, "Continue the unfinished task") {
+		t.Fatalf("resume instruction = %+v", root.Messages[2])
+	}
+}
+
+func TestAppendContinuationPayloadResponsesInput(t *testing.T) {
+	base := responsesPayload("muse-spark-1.3-contributor-free", "hello")
+	next, err := appendContinuationPayload(base, "partial answer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root struct {
+		Input []struct {
+			Type    string          `json:"type"`
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		} `json:"input"`
+	}
+	if err := json.Unmarshal(next, &root); err != nil {
+		t.Fatal(err)
+	}
+	if len(root.Input) != 3 {
+		t.Fatalf("input items = %d, want 3", len(root.Input))
+	}
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(root.Input[1].Content, &parts); err != nil {
+		t.Fatal(err)
+	}
+	if root.Input[1].Role != "assistant" || parts[0].Type != "output_text" || parts[0].Text != "partial answer" {
+		t.Fatalf("assistant item = %+v %+v", root.Input[1], parts)
+	}
+	if err := json.Unmarshal(root.Input[2].Content, &parts); err != nil {
+		t.Fatal(err)
+	}
+	if root.Input[2].Role != "user" || parts[0].Type != "input_text" || !strings.Contains(parts[0].Text, "Continue the unfinished task") {
+		t.Fatalf("user resume item = %+v %+v", root.Input[2], parts)
+	}
+}
+
+func TestAppendContinuationPayloadEmptyPartialReplays(t *testing.T) {
+	base := chatPayload("deepseek-v4.1-flash-free", "hi")
+	next, err := appendContinuationPayload(base, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(next) != string(base) {
+		t.Fatal("empty partial must return the payload unchanged")
+	}
+}
+
+func TestAppendContinuationPayloadStringInput(t *testing.T) {
+	base := []byte(`{"model":"m","input":"original question"}`)
+	next, err := appendContinuationPayload(base, "partial")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root struct {
+		Input string `json:"input"`
+	}
+	if err := json.Unmarshal(next, &root); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(root.Input, "original question") || !strings.Contains(root.Input, "partial") || !strings.Contains(root.Input, "Continue the unfinished task") {
+		t.Fatalf("string input not extended: %q", root.Input)
+	}
+}
+
+func TestAppendContinuationPayloadUnsupportedShape(t *testing.T) {
+	if _, err := appendContinuationPayload([]byte("not json"), "partial"); err == nil {
+		t.Fatal("non-JSON payload must fail")
+	}
+	if _, err := appendContinuationPayload([]byte(`{"model":"m"}`), "partial"); err == nil {
+		t.Fatal("payload without messages/input must fail")
+	}
+}
+
+func TestSSEReassemblerSawDone(t *testing.T) {
+	r := &sseReassembler{
+		rawData: false,
+		emit:    func(frame []byte) error { return nil },
+	}
+	if err := r.write([]byte("data: {\"x\":1}\n\n")); err != nil {
+		t.Fatal(err)
+	}
+	if r.sawDone {
+		t.Fatal("no [DONE] yet")
+	}
+	if err := r.write([]byte("data: [DONE]\n\n")); err != nil {
+		t.Fatal(err)
+	}
+	if !r.sawDone {
+		t.Fatal("[DONE] terminator must set sawDone")
+	}
+}
+
+func TestStreamRetryDelayCapped(t *testing.T) {
+	if got := streamRetryDelay(1); got != time.Second {
+		t.Fatalf("delay(1) = %v", got)
+	}
+	if got := streamRetryDelay(2); got != 2*time.Second {
+		t.Fatalf("delay(2) = %v", got)
+	}
+	if got := streamRetryDelay(3); got != 4*time.Second {
+		t.Fatalf("delay(3) = %v", got)
+	}
+	if got := streamRetryDelay(9); got != 8*time.Second {
+		t.Fatalf("delay(9) = %v, want capped 8s", got)
+	}
+}
+
+func TestStreamRetryableStatus(t *testing.T) {
+	for _, s := range []int{500, 502, 503, 504, 408} {
+		if !streamRetryableStatus(s) {
+			t.Fatalf("status %d should be retryable", s)
+		}
+	}
+	for _, s := range []int{200, 400, 401, 403, 404, 429} {
+		if streamRetryableStatus(s) {
+			t.Fatalf("status %d should NOT be retryable", s)
+		}
+	}
+}
+
+func TestConfigureParsesStreamRetries(t *testing.T) {
+	payload, err := json.Marshal(struct {
+		ConfigYAML []byte `json:"config_yaml"`
+	}{[]byte("stream-retries: 5\n")})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := configure(payload); err != nil {
+		t.Fatalf("configure: %v", err)
+	}
+	t.Cleanup(func() { storeConfig(defaultPluginConfig()) })
+	if got := loadedConfig().StreamRetries; got != 5 {
+		t.Fatalf("StreamRetries = %d, want 5", got)
+	}
+
+	payload, _ = json.Marshal(struct {
+		ConfigYAML []byte `json:"config_yaml"`
+	}{[]byte("stream-retries: 99\n")})
+	if err := configure(payload); err != nil {
+		t.Fatalf("configure: %v", err)
+	}
+	if got := loadedConfig().StreamRetries; got != 10 {
+		t.Fatalf("StreamRetries clamp = %d, want 10", got)
+	}
+}
+
+func TestResumeTailStringUTF8Boundary(t *testing.T) {
+	s := strings.Repeat("汉", streamResumeMaxPartialBytes/3+10) // 3 bytes each
+	tail := resumeTailString(s, 30)
+	if !utf8.ValidString(tail) {
+		t.Fatal("tail cut a rune in half")
+	}
+	if got := resumeTailString("short", 30); got != "short" {
+		t.Fatalf("short string changed: %q", got)
 	}
 }

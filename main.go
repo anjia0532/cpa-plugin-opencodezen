@@ -92,7 +92,7 @@ const (
 	defaultUserAgent = "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
 )
 
-var pluginVersion = "0.8.1"
+var pluginVersion = "0.8.2"
 
 var (
 	canonicalSessionRe = regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
@@ -1647,6 +1647,25 @@ func (m *streamResumeMonitor) anyOutput() bool {
 	return m.sawToolCall || strings.TrimSpace(m.partial.String()) != ""
 }
 
+// danglingLeadIn reports whether the emitted text ends with a lead-in marker
+// (a colon or comma, or an unclosed code fence): the model announced a next
+// step but the stream stopped before producing it.
+func (m *streamResumeMonitor) danglingLeadIn() bool {
+	s := strings.TrimSpace(m.partial.String())
+	if s == "" {
+		return false
+	}
+	if strings.Count(s, "```")%2 == 1 {
+		return true
+	}
+	runes := []rune(s)
+	switch runes[len(runes)-1] {
+	case '：', ':', '，', ',', '、', '（', '(', '【':
+		return true
+	}
+	return false
+}
+
 // appendContinuationPayload returns the request payload extended with the
 // partial answer (as an assistant turn) and the resume instruction (as a
 // user turn), so the reconnected upstream continues the broken stream
@@ -1876,6 +1895,15 @@ func runStream(req executorRequest, cfg pluginConfig, route modelRoute, baseURL 
 		completed := func() pumpOutcome {
 			if !monitor.anyOutput() {
 				return pumpOutcome{empty: true, retryable: true, errMsg: "zen upstream completed without producing any output"}
+			}
+			if !monitor.sawToolCall && monitor.danglingLeadIn() {
+				// The answer stops right after a lead-in ("...：" / "```"):
+				// the model announced the next step but the stream ended
+				// before producing it. Resume instead of accepting a
+				// half-finished turn. The wording includes "stream
+				// interrupted" so client-side guards that auto-continue on
+				// interrupted streams also engage.
+				return pumpOutcome{retryable: true, errMsg: "stream interrupted: zen upstream stopped mid-plan after a dangling lead-in"}
 			}
 			return pumpOutcome{terminal: true}
 		}

@@ -1988,11 +1988,38 @@ func TestResumeTailStringUTF8Boundary(t *testing.T) {
 
 func TestTrimJSONEnvelopeStripsBOM(t *testing.T) {
 	bom := []byte{0xEF, 0xBB, 0xBF}
+
 	if got := string(trimJSONEnvelope(append(bom, []byte(`{"model":"m"}`)...))); got != `{"model":"m"}` {
 		t.Fatalf("BOM not stripped: %q", got)
 	}
 	if got := string(trimJSONEnvelope([]byte("  \n{\"a\":1}\n "))); got != `{"a":1}` {
 		t.Fatalf("whitespace not trimmed: %q", got)
+	}
+}
+
+func TestStreamResumeMonitorDanglingLeadIn(t *testing.T) {
+	frm := func(text string) *streamResumeMonitor {
+		m := &streamResumeMonitor{}
+		raw, _ := json.Marshal(map[string]any{"choices": []any{
+			map[string]any{"delta": map[string]any{"content": text}},
+		}})
+		m.observeChatFrame([]byte("data: " + string(raw) + "\n\n"))
+		return m
+	}
+	if !frm("编辑破坏了顺序，直接重写脚本：").danglingLeadIn() {
+		t.Fatal("text ending with a full-width colon must be dangling")
+	}
+	if !frm("接下来：").danglingLeadIn() {
+		t.Fatal("colon must be dangling")
+	}
+	if !frm("```python\nprint(1)").danglingLeadIn() {
+		t.Fatal("unclosed code fence must be dangling")
+	}
+	if frm("已经写完了。").danglingLeadIn() {
+		t.Fatal("complete sentence must not be dangling")
+	}
+	if (&streamResumeMonitor{}).danglingLeadIn() {
+		t.Fatal("empty text must not be dangling")
 	}
 }
 

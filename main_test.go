@@ -1985,3 +1985,55 @@ func TestResumeTailStringUTF8Boundary(t *testing.T) {
 		t.Fatalf("short string changed: %q", got)
 	}
 }
+
+func TestTrimJSONEnvelopeStripsBOM(t *testing.T) {
+	bom := []byte{0xEF, 0xBB, 0xBF}
+	if got := string(trimJSONEnvelope(append(bom, []byte(`{"model":"m"}`)...))); got != `{"model":"m"}` {
+		t.Fatalf("BOM not stripped: %q", got)
+	}
+	if got := string(trimJSONEnvelope([]byte("  \n{\"a\":1}\n "))); got != `{"a":1}` {
+		t.Fatalf("whitespace not trimmed: %q", got)
+	}
+}
+
+func TestPrepareUpstreamBodyAcceptsBOMPayload(t *testing.T) {
+	bom := []byte{0xEF, 0xBB, 0xBF}
+	req := executorRequest{
+		Model:   "mimo-v2.6-flash-free",
+		Payload: append(bom, chatPayload("mimo-v2.6-flash-free", "hi")...),
+	}
+	if _, err := prepareUpstreamBody(req, modelRoute{Model: "mimo-v2.6-flash-free", Endpoint: "chat"}); err != nil {
+		t.Fatalf("BOM payload rejected: %v", err)
+	}
+}
+
+func TestStreamResumeMonitorAnyOutput(t *testing.T) {
+	m := &streamResumeMonitor{}
+	if m.anyOutput() {
+		t.Fatal("fresh monitor must report no output")
+	}
+	m.observeChatFrame([]byte(`data: {"choices":[{"delta":{"content":"x"}}]}` + "\n\n"))
+	if !m.anyOutput() {
+		t.Fatal("text must count as output")
+	}
+	tc := &streamResumeMonitor{}
+	tc.observeChatFrame([]byte(`data: {"choices":[{"delta":{"tool_calls":[{"index":0}]}}]}` + "\n\n"))
+	if !tc.anyOutput() {
+		t.Fatal("tool call must count as output")
+	}
+}
+
+func TestEmptyCompletionDetection(t *testing.T) {
+	empty := []byte(`{"choices":[{"index":0,"message":{"role":"assistant","content":""}}]}`)
+	if !isEmptyCompletion(empty) {
+		t.Fatal("empty content must be detected")
+	}
+	hasText := []byte(`{"choices":[{"index":0,"message":{"role":"assistant","content":"hi"}}]}`)
+	if isEmptyCompletion(hasText) {
+		t.Fatal("content must not be reported empty")
+	}
+	hasTool := []byte(`{"choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":[{"id":"c1"}]}}]}`)
+	if isEmptyCompletion(hasTool) {
+		t.Fatal("tool call must not be reported empty")
+	}
+}

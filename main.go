@@ -92,7 +92,7 @@ const (
 	defaultUserAgent = "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
 )
 
-var pluginVersion = "0.8.0"
+var pluginVersion = "0.8.1"
 
 var (
 	canonicalSessionRe = regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
@@ -1324,6 +1324,9 @@ func modelRegistration() ([]byte, error) {
 //     whole SSE answer into one JSON payload for non-streaming clients.
 func execute(payload []byte, stream bool) ([]byte, error) {
 	var req executorRequest
+	// Some clients (and hosts that forward verbatim) prepend a UTF-8 BOM;
+	// strip it so the envelope parses.
+	payload = trimJSONEnvelope(payload)
 	if len(payload) > 0 {
 		if err := json.Unmarshal(payload, &req); err != nil {
 			return nil, err
@@ -1437,7 +1440,41 @@ func executeNonStream(req executorRequest, cfg pluginConfig, route modelRoute, b
 		time.Sleep(streamRetryDelay(i + 1))
 		out, err = run(apiKey, headers)
 	}
+	// Empty turn: the upstream completed but delivered no content and no
+	// tool call. Nothing reached the client, so replaying once is safe.
+	if err == nil && cfg.StreamRetries > 0 && isEmptyCompletion(out) {
+		time.Sleep(streamRetryDelay(1))
+		replay, replayErr := run(apiKey, headers)
+		if replayErr == nil {
+			out = replay
+		}
+	}
 	return out, err
+}
+
+// isEmptyCompletion reports whether a folded chat.completion carries neither
+// text nor tool calls: an empty turn (reasoning-only or abandoned).
+func isEmptyCompletion(folded []byte) bool {
+	var root struct {
+		Choices []struct {
+			Message *struct {
+				Content   string `json:"content"`
+				ToolCalls []any  `json:"tool_calls"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(folded, &root); err != nil {
+		return false
+	}
+	for _, c := range root.Choices {
+		if c.Message == nil {
+			continue
+		}
+		if strings.TrimSpace(c.Message.Content) != "" || len(c.Message.ToolCalls) > 0 {
+			return false
+		}
+	}
+	return len(root.Choices) > 0
 }
 
 // baseURLForRequest resolves the upstream base URL. It checks the host-selected
@@ -1587,9 +1624,27 @@ func resumeTailString(s string, n int) string {
 	return tail
 }
 
+// trimJSONEnvelope strips a UTF-8 BOM and surrounding whitespace from an
+// incoming request body. Clients that emit a BOM (and hosts that forward it
+// verbatim) otherwise present a body that is not valid JSON.
+func trimJSONEnvelope(b []byte) []byte {
+	if len(b) >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF {
+		b = b[3:]
+	}
+	return []byte(strings.TrimSpace(string(b)))
+}
+
 // partialText returns the assistant text emitted downstream so far.
 func (m *streamResumeMonitor) partialText() string {
 	return strings.TrimSpace(m.partial.String())
+}
+
+// anyOutput reports whether anything reached the client at all. A stream
+// that completes with neither text nor a tool call produced an empty turn
+// (reasoning-only or silently abandoned); runStream reconnects once because
+// nothing was delivered, so the replay cannot duplicate content.
+func (m *streamResumeMonitor) anyOutput() bool {
+	return m.sawToolCall || strings.TrimSpace(m.partial.String()) != ""
 }
 
 // appendContinuationPayload returns the request payload extended with the
@@ -1800,6 +1855,7 @@ func runStream(req executorRequest, cfg pluginConfig, route modelRoute, baseURL 
 	type pumpOutcome struct {
 		terminal  bool
 		retryable bool
+		empty     bool // ended cleanly but delivered nothing to the client
 		errMsg    string
 	}
 
@@ -1813,6 +1869,16 @@ func runStream(req executorRequest, cfg pluginConfig, route modelRoute, baseURL 
 			emit:    emit,
 		}
 		terminal := func() bool { return monitor.sawFinish || reassembler.sawDone }
+		// completed reports a clean end. A clean end that delivered nothing
+		// (reasoning-only turn, or an upstream that stopped before emitting)
+		// is an empty turn: the caller replays it once, which cannot
+		// duplicate content because the client received none.
+		completed := func() pumpOutcome {
+			if !monitor.anyOutput() {
+				return pumpOutcome{empty: true, retryable: true, errMsg: "zen upstream completed without producing any output"}
+			}
+			return pumpOutcome{terminal: true}
+		}
 		truncated := func() pumpOutcome {
 			// Emit the tail event when its data lines were complete; a
 			// fragment cut mid-line would corrupt the downstream stream.
@@ -1820,7 +1886,7 @@ func runStream(req executorRequest, cfg pluginConfig, route modelRoute, baseURL 
 				_ = reassembler.flushPending()
 			}
 			if terminal() {
-				return pumpOutcome{terminal: true}
+				return completed()
 			}
 			return pumpOutcome{
 				retryable: true,
@@ -1869,13 +1935,13 @@ func runStream(req executorRequest, cfg pluginConfig, route modelRoute, baseURL 
 					if terminal() {
 						// The answer was complete; the trailing read error
 						// only means the body closed uncleanly.
-						return pumpOutcome{terminal: true}
+						return completed()
 					}
 					return pumpOutcome{retryable: true, errMsg: sc.err.Error()}
 				}
 				if sc.chunk.Error != "" {
 					if terminal() {
-						return pumpOutcome{terminal: true}
+						return completed()
 					}
 					return pumpOutcome{retryable: true, errMsg: sc.chunk.Error}
 				}
@@ -1913,6 +1979,7 @@ func runStream(req executorRequest, cfg pluginConfig, route modelRoute, baseURL 
 	// attempt loop: each iteration opens a fresh upstream stream. A broken
 	// one is retried with backoff while the downstream bridge stays open;
 	// heartbeats keep it warm during the waits.
+	emptyReplay := 0
 	for attempt := 0; ; attempt++ {
 		giveUp := func(reason string) {
 			if monitor.partialText() != "" && attempt > 0 {
@@ -1953,6 +2020,17 @@ func runStream(req executorRequest, cfg pluginConfig, route modelRoute, baseURL 
 			return
 		}
 		drainHostStream(h.StreamID)
+		if outcome.empty {
+			// Empty turn: nothing reached the client, so a replay can never
+			// duplicate content. Try once (stream-retries permitting).
+			if emptyReplay < 1 && attempt < maxRetries {
+				emptyReplay++
+				time.Sleep(streamRetryDelay(attempt + 1))
+				continue
+			}
+			giveUp(outcome.errMsg)
+			return
+		}
 		if !outcome.retryable || monitor.sawToolCall || attempt >= maxRetries {
 			giveUp(outcome.errMsg)
 			return
@@ -2107,16 +2185,17 @@ func contentFallback(req *executorRequest) string {
 //   - "stream": true (zen rejects stream:false with 403 FreeTierError)
 //   - tools contains bash + read in the dialect of the payload
 func prepareUpstreamBody(req executorRequest, route modelRoute) ([]byte, error) {
-	body := req.Payload
-	if len(body) == 0 {
-		body = req.OriginalRequest
+	payload := trimJSONEnvelope(req.Payload)
+	if len(payload) == 0 {
+		payload = trimJSONEnvelope(req.OriginalRequest)
 	}
-	trimmed := strings.TrimSpace(string(body))
+	trimmed := strings.TrimSpace(string(payload))
 	if trimmed == "" || trimmed[0] != '{' {
-		return nil, fmt.Errorf("zen executor: unsupported payload shape")
+		return nil, fmt.Errorf("zen executor: unsupported payload shape (payload=%d bytes, original=%d bytes, head=%q)",
+			len(req.Payload), len(req.OriginalRequest), truncate(req.Payload, 64))
 	}
 	var root map[string]any
-	if err := json.Unmarshal(body, &root); err != nil {
+	if err := json.Unmarshal(payload, &root); err != nil {
 		return nil, fmt.Errorf("zen executor: payload is not valid JSON: %w", err)
 	}
 

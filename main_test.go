@@ -2064,3 +2064,112 @@ func TestEmptyCompletionDetection(t *testing.T) {
 		t.Fatal("tool call must not be reported empty")
 	}
 }
+
+func TestConverterRecoversToolCallFromCompletedPayload(t *testing.T) {
+	// Some gateways stream a short prefix and then deliver the authoritative
+	// items only inside response.completed; the tool call must not be lost.
+	c := newResponsesChatStreamConverter("mimo-v2.6-flash-free")
+	payload := []byte(`{"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[{"id":"fc_1","type":"function_call","call_id":"call_1","name":"bash","arguments":"{\"command\":\"ls\"}"}]}}`)
+	outs, err := c.convert(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawTool, sawFinish bool
+	for _, out := range outs {
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					ToolCalls []struct {
+						ID       string `json:"id"`
+						Function struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						} `json:"function"`
+					} `json:"tool_calls"`
+				} `json:"delta"`
+				FinishReason *string `json:"finish_reason"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal(out, &chunk); err != nil {
+			t.Fatal(err)
+		}
+		for _, ch := range chunk.Choices {
+			if len(ch.Delta.ToolCalls) > 0 {
+				sawTool = true
+				call := ch.Delta.ToolCalls[0]
+				if call.ID != "call_1" || call.Function.Name != "bash" || call.Function.Arguments != `{"command":"ls"}` {
+					t.Fatalf("tool call = %+v", call)
+				}
+			}
+			if ch.FinishReason != nil && *ch.FinishReason != "" {
+				sawFinish = true
+				if *ch.FinishReason != "tool_calls" {
+					t.Fatalf("finish = %q, want tool_calls", *ch.FinishReason)
+				}
+			}
+		}
+	}
+	if !sawTool || !sawFinish {
+		t.Fatalf("sawTool=%v sawFinish=%v", sawTool, sawFinish)
+	}
+}
+
+func TestConverterRecoversTextFromCompletedPayload(t *testing.T) {
+	c := newResponsesChatStreamConverter("mimo-v2.6-flash-free")
+	payload := []byte(`{"type":"response.completed","response":{"id":"resp_2","status":"completed","output":[{"id":"msg_1","type":"message","content":[{"type":"output_text","text":"最终答复"}]}]}}`)
+	outs, err := c.convert(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawText bool
+	for _, out := range outs {
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content string `json:"content"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal(out, &chunk); err != nil {
+			t.Fatal(err)
+		}
+		for _, ch := range chunk.Choices {
+			if ch.Delta.Content == "最终答复" {
+				sawText = true
+			}
+		}
+	}
+	if !sawText {
+		t.Fatal("text delivered only in response.completed must be recovered")
+	}
+}
+
+func TestConverterDoesNotDuplicateStreamedItems(t *testing.T) {
+	// When the items were already streamed, the completion payload must not
+	// re-emit them.
+	c := newResponsesChatStreamConverter("mimo-v2.6-flash-free")
+	if _, err := c.convert([]byte(`{"type":"response.output_text.delta","item_id":"msg_1","delta":"hi"}`)); err != nil {
+		t.Fatal(err)
+	}
+	outs, err := c.convert([]byte(`{"type":"response.completed","response":{"id":"resp_3","status":"completed","output":[{"id":"msg_1","type":"message","content":[{"type":"output_text","text":"hi"}]}]}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, out := range outs {
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content string `json:"content"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal(out, &chunk); err != nil {
+			t.Fatal(err)
+		}
+		for _, ch := range chunk.Choices {
+			if ch.Delta.Content != "" {
+				t.Fatalf("streamed text re-emitted: %q", ch.Delta.Content)
+			}
+		}
+	}
+}

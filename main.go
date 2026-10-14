@@ -92,7 +92,7 @@ const (
 	defaultUserAgent = "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
 )
 
-var pluginVersion = "0.8.2"
+var pluginVersion = "0.8.3"
 
 var (
 	canonicalSessionRe = regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
@@ -4025,6 +4025,7 @@ type responsesChatStreamConverter struct {
 	nextTool  int
 	toolArgs  map[string]bool // item id -> arguments already streamed
 	toolCallN int
+	textN     int
 }
 
 func newResponsesChatStreamConverter(model string) *responsesChatStreamConverter {
@@ -4034,6 +4035,76 @@ func newResponsesChatStreamConverter(model string) *responsesChatStreamConverter
 		toolIdx:  map[string]int{},
 		toolArgs: map[string]bool{},
 	}
+}
+
+// responsesOutputItem is one entry of a responses completion payload's
+// output array.
+type responsesOutputItem struct {
+	ID        string          `json:"id"`
+	Type      string          `json:"type"`
+	CallID    string          `json:"call_id"`
+	Name      string          `json:"name"`
+	Arguments string          `json:"arguments"`
+	Input     json.RawMessage `json:"input"`
+	Content   []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	} `json:"content"`
+}
+
+// recoverFinalItems emits tool calls and text that arrived only inside the
+// final completion payload instead of as per-item streaming events. Some
+// gateways deliver a short streamed prefix and then the authoritative items
+// in response.completed; without this recovery a finished turn would reach
+// the client with its tool call (or its whole answer) silently missing while
+// still looking complete.
+func (c *responsesChatStreamConverter) recoverFinalItems(output []responsesOutputItem) [][]byte {
+	var outs [][]byte
+	if c.toolCallN == 0 {
+		for _, item := range output {
+			if item.Type != "function_call" && item.Type != "custom_tool_call" {
+				continue
+			}
+			id := item.CallID
+			if id == "" {
+				id = item.ID
+			}
+			args := item.Arguments
+			if args == "" {
+				args = rawString(item.Input)
+			}
+			c.toolCallN++
+			outs = append(outs, c.chunk(map[string]any{
+				"tool_calls": []any{map[string]any{
+					"index": c.toolIndexFor(item.ID),
+					"id":    id,
+					"type":  "function",
+					"function": map[string]any{
+						"name":      item.Name,
+						"arguments": args,
+					},
+				}},
+			}, nil, nil))
+		}
+	}
+	if c.textN == 0 {
+		var text strings.Builder
+		for _, item := range output {
+			if item.Type != "message" {
+				continue
+			}
+			for _, part := range item.Content {
+				if part.Type == "output_text" || part.Type == "text" {
+					text.WriteString(part.Text)
+				}
+			}
+		}
+		if text.Len() > 0 {
+			c.textN++
+			outs = append(outs, c.chunk(map[string]any{"content": text.String()}, nil, nil))
+		}
+	}
+	return outs
 }
 
 // convert maps one SSE payload (responses event JSON, framing stripped) to
@@ -4061,6 +4132,7 @@ func (c *responsesChatStreamConverter) convert(payload []byte) ([][]byte, error)
 				OutputTokens int64 `json:"output_tokens"`
 				TotalTokens  int64 `json:"total_tokens"`
 			} `json:"usage"`
+			Output []responsesOutputItem `json:"output"`
 		} `json:"response"`
 		Item struct {
 			ID        string          `json:"id"`
@@ -4161,6 +4233,7 @@ func (c *responsesChatStreamConverter) convert(payload []byte) ([][]byte, error)
 		if ev.Delta == "" {
 			return nil, nil
 		}
+		c.textN++
 		return [][]byte{c.chunk(map[string]any{"content": ev.Delta}, nil, nil)}, nil
 	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
 		if ev.ItemID != "" {
@@ -4186,6 +4259,7 @@ func (c *responsesChatStreamConverter) convert(payload []byte) ([][]byte, error)
 			if text.Len() == 0 {
 				return nil, nil
 			}
+			c.textN++
 			return [][]byte{c.chunk(map[string]any{"content": text.String()}, nil, nil)}, nil
 		}
 		if ev.Item.ID == "" || c.sawDelta[ev.Item.ID] {
@@ -4222,11 +4296,13 @@ func (c *responsesChatStreamConverter) convert(payload []byte) ([][]byte, error)
 				"total_tokens":      ev.Response.Usage.TotalTokens,
 			}
 		}
+		outs := c.recoverFinalItems(ev.Response.Output)
 		finish := "stop"
 		if c.toolCallN > 0 {
 			finish = "tool_calls"
 		}
-		return [][]byte{c.chunk(map[string]any{}, strPtr(finish), usage)}, nil
+		outs = append(outs, c.chunk(map[string]any{}, strPtr(finish), usage))
+		return outs, nil
 	case "response.incomplete":
 		// Truncated upstream responses are not failures: everything streamed
 		// so far is valid, so finish the chat stream normally instead of
@@ -4239,11 +4315,13 @@ func (c *responsesChatStreamConverter) convert(payload []byte) ([][]byte, error)
 				"total_tokens":      ev.Response.Usage.TotalTokens,
 			}
 		}
+		outs := c.recoverFinalItems(ev.Response.Output)
 		finish := "length"
 		if r := ev.Response.IncompleteDetails; r != nil && r.Reason != "" && r.Reason != "max_output_tokens" {
 			finish = "content_filter"
 		}
-		return [][]byte{c.chunk(map[string]any{}, strPtr(finish), usage)}, nil
+		outs = append(outs, c.chunk(map[string]any{}, strPtr(finish), usage))
+		return outs, nil
 	case "response.failed":
 		msg := "upstream response failed"
 		if ev.Response.Error != nil && ev.Response.Error.Message != "" {
